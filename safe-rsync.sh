@@ -3,54 +3,178 @@
 # ==============================================================================
 #                               CONFIGURATIONS
 # ==============================================================================
-NEWSERVERIP="192.168.1.1"
+
+# Src Configurations
 SSH_USER="root"
-SSH_PORT="22"
 SSH_KEY="/root/.ssh/id_rsa"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-#Default paths in SRC & DST
-#Make sure you have paths in both SRC & DST servers
-PATHS=(
-    "/path/1-default/*"
-    "/path/2-default/*"
-    "/path/3-default/*"
-    "/path/4-default/*"
-)
+RUN_DATE=$(date +"%Y%m%d_%H%M")
 
-#Default rsync & output files paths
+# Log files
+LOG_FILE="${BASE_DIR}/rsync_output_${RUN_DATE}.log"
+PID_FILE="${BASE_DIR}/rsync_proc_${RUN_DATE}.pid"
+
+# Files For Auditing the user
+AUDIT_LOG="${BASE_DIR}/migration_audit_${RUN_DATE}.log"
+
+LOCK_FILE="/var/run/path_migration.lock"
+
+# Default Options
+DEFAULT_IP="192.168.1.1"
+DEFAULT_PORT="22"
+DEFAULT_SWITCHES_1="-arvzHP --info=progress2"
+DEFAULT_SWITCHES_2="-arvzHP --info=progress2 --delete-after"
+
+# Rsync Binary paths
 RSYNC_BIN="/opt/path/common/bin/rsync"
 REMOTE_RSYNC_PATH="/opt/path/common/bin/rsync"
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${BASE_DIR}/rsync_output.log"
-PID_FILE="${BASE_DIR}/rsync_proc.pid"
 
-#Rsync switches
-DEFAULT_SWITCHES="-arvzHP --info=progress2"
+# Using for Define paths
+SRC_PATHS=()
+DST_PATHS=()
 
-#just a few designing for a better look
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[1;36m'
-NC='\033[0;0m' # No Color
+CYAN='\033[1;36m'
+NC='\033[0;0m'
 
 # ==============================================================================
-#                                   FUNCTIONS
+#                                  FUNCTIONS
 # ==============================================================================
 
-#Force stop
+# Error handelling
 fail() {
     echo -e "\n${RED}[ERROR] $1${NC}\n"
     exit 1
 }
 
-#User validation (press ENTER)
 wait_for_user() {
     echo -e "${YELLOW}\n[PRESS ENTER TO CONTINUE OR CTRL+C TO ABORT]${NC}"
     read -r
 }
 
-#Do you think it needs any comment??
+get_network_info() {
+    echo -e "${BLUE}=== STEP 0.1: Network Configuration ===${NC}"
+
+    echo -ne "Enter Destination IP [Default: $DEFAULT_IP]: "
+    read -r input_ip
+    NEWSERVERIP=${input_ip:-$DEFAULT_IP}
+
+    echo -ne "Enter SSH Port [Default: $DEFAULT_PORT]: "
+    read -r input_port
+    SSH_PORT=${input_port:-$DEFAULT_PORT}
+
+    echo -e "${GREEN}Target set to -> ${SSH_USER}@${NEWSERVERIP}:${SSH_PORT}${NC}\n"
+}
+
+get_paths_configuration() {
+    echo -e "${BLUE}=== STEP 0.2: Paths Configuration ===${NC}"
+    echo -e "Available Default Paths Table:"
+    echo -e "------------------------------------------------"
+    echo -e " [1] /path/default-1/"
+    echo -e " [2] /path/default-2/"
+    echo -e " [3] /var/log/"
+    echo -e " [C] Custom Path (Enter manually)"
+    echo -e "------------------------------------------------"
+
+    while true; do
+        echo -ne "Select a path option (1-5) or 'C' for Custom [or 'D' if Done selecting]: "
+        read -r choice
+
+        case "$choice" in
+            1) src="/path/default-1/" ;;
+            2) src="/path/default-2/" ;;
+            3) src="/var/log/" ;;
+            [cC])
+                echo -ne "Enter Custom SOURCE Path (e.g. /home/user/data/): "
+                read -r src
+                if [ -z "$src" ]; then
+                    echo -e "${RED}Source path cannot be empty!${NC}"
+                    continue
+                fi
+                ;;
+            [dD])
+                if [ ${#SRC_PATHS[@]} -eq 0 ]; then
+                    echo -e "${RED}You must select at least one path before continuing!${NC}"
+                    continue
+                fi
+                break
+                ;;
+            *)
+                echo -e "${RED}Invalid option! Please try again.${NC}"
+                continue
+                ;;
+        esac
+
+        echo -e "Selected Source: ${YELLOW}$src${NC}"
+        echo -ne "Enter DESTINATION path for this source [Press Enter to keep it identical]: "
+        read -r dst
+
+        if [ -z "$dst" ]; then
+            dst="${src%\*}"
+        fi
+
+        SRC_PATHS+=("$src")
+        DST_PATHS+=("$dst")
+        echo -e "${GREEN}Mapped: [Source] $src  ==>  [Destination] $dst${NC}\n"
+    done
+}
+
+get_rsync_switches() {
+    echo -e "\n${BLUE}=== STEP 0.3: Rsync Switches Configuration ===${NC}"
+    echo -e "Select Rsync Switches Profile:"
+    echo -e " [1] Default Migrate Without Delete Any File (${GREEN}$DEFAULT_SWITCHES_1${NC})"
+    echo -e " [2] Standard Mirror (${GREEN}$DEFAULT_SWITCHES_2${NC})"
+    echo -e " [3] Custom Switches (Type your own)"
+
+    while true; do
+        echo -ne "Enter your choice (1-3): "
+        read -r sw_choice
+
+        if [ "$sw_choice" == "1" ]; then
+            FINAL_SWITCHES="$DEFAULT_SWITCHES_1"
+            break
+        elif [ "$sw_choice" == "2" ]; then
+            FINAL_SWITCHES="$DEFAULT_SWITCHES_2"
+            break
+        elif [ "$sw_choice" == "3" ]; then
+            echo -ne "Type your custom rsync switches (e.g. -avz --exclude 'temp'): "
+            read -r FINAL_SWITCHES
+            if [ -z "$FINAL_SWITCHES" ]; then
+                echo -e "${RED}Switches cannot be empty!${NC}"
+                continue
+            fi
+            break
+        else
+            echo -e "${RED}Invalid choice!${NC}"
+        fi
+    done
+    echo -e "${GREEN}Final Switches Set: $FINAL_SWITCHES${NC}\n"
+}
+
+write_audit_log() {
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local execution_user
+    execution_user=$(whoami)
+
+    echo "=========================================================================" >> "$AUDIT_LOG"
+    echo "TIMESTAMP        : $timestamp" >> "$AUDIT_LOG"
+    echo "OPERATOR USER    : $execution_user" >> "$AUDIT_LOG"
+    echo "DESTINATION IP   : $NEWSERVERIP (Port: $SSH_PORT)" >> "$AUDIT_LOG"
+    echo "RSYNC SWITCHES   : $FINAL_SWITCHES" >> "$AUDIT_LOG"
+    echo "MAPPED PATHS     :" >> "$AUDIT_LOG"
+
+    for i in "${!SRC_PATHS[@]}"; do
+        echo "  - [SRC]: ${SRC_PATHS[$i]}  -->  [DST]: ${DST_PATHS[$i]}" >> "$AUDIT_LOG"
+    done
+    echo "=========================================================================" >> "$AUDIT_LOG"
+}
+
 check_ssh_connection() {
     echo -e "${BLUE}=== STEP 1: Testing SSH Connection ===${NC}"
     echo "Connecting to ${SSH_USER}@${NEWSERVERIP} on port ${SSH_PORT}..."
@@ -63,7 +187,7 @@ check_ssh_connection() {
         fail "Connection timed out or SSH key authentication failed!"
     fi
 }
-#Check for any rsync proccess running in DST server(just by name filtering)
+
 check_remote_rsync() {
     echo -e "${BLUE}=== STEP 2: Checking Active Rsync Processes on Destination ===${NC}"
     echo "Scanning remote process table for exact path conflicts..."
@@ -81,11 +205,10 @@ check_remote_rsync() {
 
     while read -r pid cmd; do
         [ -z "$pid" ] && continue
-
         local line_has_conflict=false
 
-        for path_pattern in "${PATHS[@]}"; do
-            local clean_path="${path_pattern%\*}"
+        for dst_path in "${DST_PATHS[@]}"; do
+            local clean_path="${dst_path%\*}"
 
             if echo "$cmd" | grep -q -F "$clean_path"; then
                 echo -e "${RED}[CRITICAL CONFLICT] An active rsync is currently operating on your target path!${NC}"
@@ -104,22 +227,20 @@ check_remote_rsync() {
     done <<< "$remote_ps"
 
     if [ "$has_critical_conflict" = true ]; then
-        fail "Migration aborted due to a destination path conflict. Please wait for the remote rsync to finish or terminate it."
+        fail "Migration aborted due to a destination path conflict."
     fi
 
     if [ ! -z "$non_conflict_processes" ]; then
         echo -e "${YELLOW}[WARNING] Active rsync processes detected on the destination (No path conflicts):${NC}"
         echo -e "$non_conflict_processes"
-
         echo -ne "Do you want to ignore these unrelated rsync tasks and proceed? [y/N]: "
         read -r response
         if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             fail "Migration cancelled by user due to active remote rsync activities."
         fi
-        echo -e "${GREEN}Warning ignored. Moving to the next step...${NC}"
     fi
 }
-#Check for any rsync proccess running in DST server(with lsof in OS layer)
+
 check_remote_lsof() {
     echo -e "${BLUE}=== STEP 3: Checking Open Files on Destination via lsof ===${NC}"
     echo "Scanning target directories for active file locks..."
@@ -130,8 +251,8 @@ check_remote_lsof() {
 
     > "$LOCKS_LOG"
 
-    for path_pattern in "${PATHS[@]}"; do
-        local clean_path="${path_pattern%\*}"
+    for dst_path in "${DST_PATHS[@]}"; do
+        local clean_path="${dst_path%\*}"
 
         local dir_exists
         dir_exists=$(ssh -i "$SSH_KEY" -p "$SSH_PORT" "${SSH_USER}@${NEWSERVERIP}" "[ -d '$clean_path' ] && echo 'YES' || echo 'NO'" 2>/dev/null)
@@ -143,7 +264,6 @@ check_remote_lsof() {
         if [ ! -z "$remote_locks" ]; then
             local formatted_pids
             formatted_pids=$(echo "$remote_locks" | tr '\n' ',' | sed 's/,$//')
-
             local process_list
             process_list=$(ssh -i "$SSH_KEY" -p "$SSH_PORT" "${SSH_USER}@${NEWSERVERIP}" "ps -p $formatted_pids -o pid,comm,args --no-headers" 2>/dev/null)
 
@@ -153,8 +273,6 @@ check_remote_lsof() {
                 if [ "$comm" == "rsync" ]; then
                     echo -e "${RED}[CRITICAL CONFLICT] Another rsync process is actively migrating data to this directory!${NC}"
                     echo -e "-> ${YELLOW}Path:${NC} $clean_path"
-                    echo -e "-> ${YELLOW}Remote PID:${NC} $pid"
-                    echo -e "-> ${YELLOW}Command:${NC} $args\n"
                     has_rsync_conflict=true
                 else
                     if [ "$has_minor_warnings" = false ]; then
@@ -166,37 +284,30 @@ check_remote_lsof() {
             done <<< "$process_list"
         fi
     done
-
+LOCKS_LOG1=$LOCKS_LOG
     if [ "$has_rsync_conflict" = true ]; then
-        fail "Migration aborted. An active rsync session was detected on the destination paths. You CANNOT run multiple instances."
+        fail "Migration aborted. An active rsync session was detected on the destination paths."
     fi
 
     if [ "$has_minor_warnings" = true ]; then
         echo -e "${YELLOW}[WARNING] Some non-rsync processes are currently accessing the target paths.${NC}"
-        echo -e "💡 Detailed process logs have been saved to: ${BLUE}$LOCKS_LOG${NC}"
-        echo -e "👉 Check this file in another terminal using: ${GREEN}cat $LOCKS_LOG${NC}"
-
+        echo -e "💡 Detailed process logs have been saved to: ${CYAN}$LOCKS_LOG${NC}"
         echo -ne "\nDo you want to ignore these locks and proceed anyway? [y/N]: "
         read -r response
         if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             fail "Migration cancelled by user after reviewing destination logs."
         fi
-        echo -e "${GREEN}Warning ignored. Moving to the next step...${NC}"
-    else
-        echo -e "${GREEN}[OK] No conflicting file locks detected on target paths.${NC}"
     fi
 }
 
-#Check the size of the SRC directories
 check_source_volumes() {
-    echo -e "${BLUE}=== STEP 5: Checking Source Directories Size ===${NC}"
+    echo -e "${BLUE}=== STEP 4: Checking Source Directories Size ===${NC}"
     echo -e "------------------------------------------------"
     printf "%-35s | %-10s\n" "Source Path" "Size"
     echo -e "------------------------------------------------"
 
-    for path_pattern in "${PATHS[@]}"; do
-        #remove "*" for run "du -sh"
-        base_path="${path_pattern%\*}"
+    for src_path in "${SRC_PATHS[@]}"; do
+        base_path="${src_path%\*}"
 
         if [ -d "$base_path" ]; then
             size_human=$(du -sh "$base_path" | awk '{print $1}')
@@ -208,130 +319,100 @@ check_source_volumes() {
     echo -e "------------------------------------------------"
 }
 
-#Check the existence, mount status, and volume of disks at the DST
 check_destination_status() {
-    echo -e "${BLUE}=== STEP 6: Validating Destination Disks & Space ===${NC}"
+    echo -e "${BLUE}=== STEP 5: Validating Destination Disks & Space ===${NC}"
 
-    for path_pattern in "${PATHS[@]}"; do
-        base_path="${path_pattern%\*}"
+    for i in "${!SRC_PATHS[@]}"; do
+        local src_base="${SRC_PATHS[$i]%\*}"
+        local dst_base="${DST_PATHS[$i]%\*}"
 
-        #Dont Check the existence in SRC
-        if [ ! -d "$base_path" ]; then
+        if [ ! -d "$src_base" ]; then
             continue
         fi
 
-        echo -e "\nChecking ${base_path} on remote server..."
+        echo -e "\nChecking Target Directory [ ${dst_base} ] on remote server..."
 
-        #Remote commands to check directory existence, mount point (for /disks/ paths) and free volume
         remote_script="
-            if [ ! -d '$base_path' ]; then
-                echo '$base_path NOT_EXISTS'
+            if [ ! -d '$dst_base' ]; then
+                echo 'NOT_EXISTS'
                 exit
             fi
-            if [[ '$base_path' == /disks/* ]]; then
-                if ! mountpoint -q '$base_path'; then
-                    echo '$base_path NOT_MOUNTED'
+            if [[ '$dst_base' == /disks/* ]]; then
+                if ! mountpoint -q '$dst_base'; then
+                    echo 'NOT_MOUNTED'
                     exit
                 fi
             fi
-            df -P '$base_path' | tail -1 | awk '{print \$4}' #Size(KB)
+            echo \$(df -P '$dst_base' | tail -1 | awk '{print \$4}') \$(df -h '$dst_base' | tail -1 | awk '{print \$4}')
         "
 
         remote_output=$(ssh -i "$SSH_KEY" -p "$SSH_PORT" "${SSH_USER}@${NEWSERVERIP}" "$remote_script" 2>/dev/null)
 
         if [ "$remote_output" == "NOT_EXISTS" ]; then
-            fail "Path [ $base_path ] does not exist on remote server!"
+            fail "Path [ $dst_base ] does not exist on remote server!"
         elif [ "$remote_output" == "NOT_MOUNTED" ]; then
-            fail "Disk [ $base_path ] is NOT mounted properly on remote server!"
+            fail "Disk [ $dst_base ] is NOT mounted properly on remote server!"
         fi
 
-        #Some mathematics (compare volumes)
-        local_size_kb=$(du -sk "$base_path" | awk '{print $1}')
-        remote_free_kb=$remote_output
-
-        local_human=$(du -sh "$base_path" | awk '{print $1}')
-        remote_free_human=$(ssh -i "$SSH_KEY" -p "$SSH_PORT" "${SSH_USER}@${NEWSERVERIP}" "df -h '$base_path' | tail -1 | awk '{print \$4}'" 2>/dev/null)
+        remote_free_kb=$(echo "$remote_output" | awk '{print $1}')
+        remote_free_human=$(echo "$remote_output" | awk '{print $2}')
+        local_size_kb=$(du -sk "$src_base" | awk '{print $1}')
+        local_human=$(du -sh "$src_base" | awk '{print $1}')
 
         echo -e "-> Local Data Size: ${YELLOW}$local_human${NC}"
         echo -e "-> Remote Free Space: ${GREEN}$remote_free_human${NC}"
 
         if [ "$local_size_kb" -gt "$remote_free_kb" ]; then
-            fail "Not enough space on remote disk [ $base_path ]! Free up space and try again."
+            fail "Not enough space on remote disk [ $dst_base ]!"
         else
-            echo -e "${GREEN}[OK] Space validation passed for $base_path.${NC}"
+            echo -e "${GREEN}[OK] Space validation passed for $dst_base.${NC}"
         fi
     done
 }
 
-#Interactive review rsync switches
-configure_rsync_switches() {
-    echo -e "${BLUE}=== STEP 7: Reviewing Rsync Switches ===${NC}"
-    echo -e "Base Switches: ${GREEN}${DEFAULT_SWITCHES}${NC} (Archive, Verbose, Compress, Human-readable, Resume)"
-
-    echo -ne "\nDo you want to include ${YELLOW}--delete-after${NC}? (This deletes files in destination that don't exist in source after transfer) [Y/n]: "
-    read -r response
-
-    if [[ -z "$response" || "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        FINAL_SWITCHES="${DEFAULT_SWITCHES} --delete-after"
-        echo -e "${GREEN}Added --delete-after to final command.${NC}"
-    else
-        FINAL_SWITCHES="${DEFAULT_SWITCHES}"
-        echo -e "${YELLOW}Skipped --delete-after.${NC}"
-    fi
-}
-
-#Executation & logging(log file + PID-log file )
 execute_migration() {
-    echo -e "${BLUE}=== STEP 8: Executing Migration in Background ===${NC}"
-    echo -e "Log file location: ${YELLOW}${LOG_FILE}${NC}"
-    echo -e "PID log file location: ${YELLOW}${PID_FILE}${NC}"
+    echo -e "${BLUE}=== STEP 6: Executing Migration in Background ===${NC}"
 
-    echo -e "\n${GREEN}Starting synchronization for active paths...${NC}"
+    write_audit_log
 
-    for path_pattern in "${PATHS[@]}"; do
-        base_path="${path_pattern%\*}"
+    for i in "${!SRC_PATHS[@]}"; do
+        local src="${SRC_PATHS[$i]}"
+        local dst_base="${DST_PATHS[$i]%\*}"
 
-        #Ignoring SRC paths existence
-        if [ ! -d "$base_path" ]; then
+        if [ ! -d "${src%\*}" ]; then
             continue
         fi
 
-        echo -e "\n------------------------------------------------"
-        echo -e "Launching rsync for: ${YELLOW}${path_pattern}${NC}"
+        echo -e "Launching rsync for: ${YELLOW}${src}${NC} -> ${GREEN}${dst_base}${NC}"
 
-        #Rsync executation command
-        $RSYNC_BIN --rsync-path="$REMOTE_RSYNC_PATH" $FINAL_SWITCHES \
-            -e "ssh -C -p $SSH_PORT -i $SSH_KEY" \
-            "$path_pattern" "${SSH_USER}@${NEWSERVERIP}:${base_path}" >> "$LOG_FILE" 2>&1 &
+        $RSYNC_BIN --rsync-path="$REMOTE_RSYNC_PATH" $FINAL_SWITCHES -e "ssh -C -p $SSH_PORT -i $SSH_KEY" "$src" "${SSH_USER}@${NEWSERVERIP}:${dst_base}" >> "$LOG_FILE" 2>&1 &
 
-        #Variable for PID logging
         RSYNC_PID=$!
-
-        #Logging format
-        CURRENT_TIME=$(date +"%Y %b %d %H:%M")
-        PID_ENTRY="${CURRENT_TIME} : PID=${RSYNC_PID} (Path: ${base_path})"
-
-        #Create & appending PID-log file
+        PID_ENTRY="$(date +"%Y %b %d %H:%M") : PID=${RSYNC_PID} (Path: ${src} -> ${dst_base})"
         echo "$PID_ENTRY" >> "$PID_FILE"
-
-        #Print in Terminal
-        echo -e "-> ${GREEN}Rsync started in Background!${NC}"
-        echo -e "-> Logged Entry: ${BLUE}${PID_ENTRY}${NC}"
     done
 
     echo -e "\n===================================================="
     echo -e "${GREEN}All tasks have been successfully sent to Background!${NC}"
-    echo -e "You can close this terminal safely."
-    echo -e "To monitor progress manually, run: ${YELLOW}tail -f ${LOG_FILE}${NC}"
+    echo -e "Audit logs saved to: ${CYAN}${AUDIT_LOG}${NC}"
+    echo -e "Rsync logs saved to: ${CYAN}${LOG_FILE}${NC}"
+    echo -e "PID saved to: ${CYAN}${PID_FILE}${NC}"
+    echo -e "Destination Processes saved to: ${CYAN}${LOCKS_LOG1}${NC}"
     echo -e "===================================================="
 }
 
 # ==============================================================================
 #                               MAIN EXECUTION
 # ==============================================================================
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo -e "\n\033[0;31m[ERROR] This migration script is ALREADY running on this server!\033[0;0m\n"
+    exit 1
+fi
+
 clear
 echo -e "${YELLOW}====================================================${NC}"
-echo -e "${YELLOW}       HIGH-VOLUME DATA Transfer SCRIPT             ${NC}"
+echo -e "${YELLOW}       INTERACTIVE SAFE RSYNC V2.0.0          ${NC}"
 echo -e "${YELLOW}====================================================${NC}\n"
 echo -e "${YELLOW}"
 cat << 'EOF'
@@ -340,18 +421,21 @@ cat << 'EOF'
 \___ \ / _` | |_ / _ \ | |_) / __| | | | '_ \ / __|
  ___) | (_| |  _|  __/ |  _ <\__ \ |_| | | | | (__
 |____/ \__,_|_|  \___| |_| \_\___/\__, |_| |_|\___|
-                                  |___/
+                                  |___/             V 2.0.0
 Written By : https://github.com/mrangoh01
 EOF
 echo -e "${NC}\n"
 
+get_network_info
+get_paths_configuration
+get_rsync_switches
 
 check_ssh_connection
 wait_for_user
 
 check_remote_rsync
 check_remote_lsof
-#wait_for_user
+wait_for_user
 
 check_source_volumes
 wait_for_user
@@ -359,8 +443,4 @@ wait_for_user
 check_destination_status
 wait_for_user
 
-configure_rsync_switches
-wait_for_user
-
 execute_migration
-
